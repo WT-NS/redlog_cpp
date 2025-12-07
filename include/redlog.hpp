@@ -9,6 +9,7 @@
 #include <iomanip>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -249,6 +250,9 @@ template <typename T> std::string stringify(T&& value) {
     return std::string(value);
   } else if constexpr (std::is_same_v<decay_t, const char*> || std::is_same_v<decay_t, char*>) {
     return value ? std::string(value) : "null";
+  } else if constexpr (std::is_same_v<decay_t, char> || std::is_same_v<decay_t, signed char> ||
+                       std::is_same_v<decay_t, unsigned char>) {
+    return std::string(1, static_cast<char>(value));
   }
   // handle arithmetic types
   else if constexpr (std::is_arithmetic_v<decay_t>) {
@@ -618,6 +622,7 @@ inline int get_max_level_text_width() {
 class config {
   std::atomic<level> min_level_{level::info};
   theme theme_ = themes::default_theme;
+  mutable std::mutex theme_mutex_;
 
 public:
   static config& instance() {
@@ -629,9 +634,15 @@ public:
 
   void set_level(level l) noexcept { min_level_.store(l, std::memory_order_relaxed); }
 
-  theme get_theme() const { return theme_; }
+  theme get_theme() const {
+    std::lock_guard<std::mutex> lock(theme_mutex_);
+    return theme_;
+  }
 
-  void set_theme(const theme& t) { theme_ = t; }
+  void set_theme(const theme& t) {
+    std::lock_guard<std::mutex> lock(theme_mutex_);
+    theme_ = t;
+  }
 };
 
 } // namespace detail
@@ -686,9 +697,6 @@ public:
   std::size_t size() const { return fields_.size(); }
 };
 
-/**
- * Log entry representing a single log message with metadata.
- */
 struct log_entry {
   level level_val;
   std::string message;
@@ -701,86 +709,80 @@ struct log_entry {
         timestamp(std::chrono::system_clock::now()) {}
 };
 
-/**
- * Formatter interface for customizable output.
- */
 class formatter {
 public:
   virtual ~formatter() = default;
   virtual std::string format(const log_entry& entry) const = 0;
 };
 
-/**
- * Default formatter producing beautiful aligned output.
- *
- * Format: [source]      [lvl] message                    key=value key=value
- */
 class default_formatter : public formatter {
-  theme theme_;
+  bool use_custom_theme_ = false;
+  theme theme_{};
 
-  color level_color(level l) const {
+  color level_color(level l, const theme& theme_ref) const {
     switch (l) {
     case level::critical:
-      return theme_.critical_color;
+      return theme_ref.critical_color;
     case level::error:
-      return theme_.error_color;
+      return theme_ref.error_color;
     case level::warn:
-      return theme_.warn_color;
+      return theme_ref.warn_color;
     case level::info:
-      return theme_.info_color;
+      return theme_ref.info_color;
     case level::verbose:
-      return theme_.verbose_color;
+      return theme_ref.verbose_color;
     case level::trace:
-      return theme_.trace_color;
+      return theme_ref.trace_color;
     case level::debug:
-      return theme_.debug_color;
+      return theme_ref.debug_color;
     case level::pedantic:
-      return theme_.pedantic_color;
+      return theme_ref.pedantic_color;
     case level::annoying:
-      return theme_.annoying_color;
+      return theme_ref.annoying_color;
     default:
       return color::white;
     }
   }
 
-  color level_bg_color(level l) const {
+  color level_bg_color(level l, const theme& theme_ref) const {
     switch (l) {
     case level::critical:
-      return theme_.critical_bg_color;
+      return theme_ref.critical_bg_color;
     case level::error:
-      return theme_.error_bg_color;
+      return theme_ref.error_bg_color;
     case level::warn:
-      return theme_.warn_bg_color;
+      return theme_ref.warn_bg_color;
     case level::info:
-      return theme_.info_bg_color;
+      return theme_ref.info_bg_color;
     case level::verbose:
-      return theme_.verbose_bg_color;
+      return theme_ref.verbose_bg_color;
     case level::trace:
-      return theme_.trace_bg_color;
+      return theme_ref.trace_bg_color;
     case level::debug:
-      return theme_.debug_bg_color;
+      return theme_ref.debug_bg_color;
     case level::pedantic:
-      return theme_.pedantic_bg_color;
+      return theme_ref.pedantic_bg_color;
     case level::annoying:
-      return theme_.annoying_bg_color;
+      return theme_ref.annoying_bg_color;
     default:
       return color::none;
     }
   }
 
 public:
-  default_formatter() : theme_(detail::config::instance().get_theme()) {}
-  explicit default_formatter(const theme& t) : theme_(t) {}
+  default_formatter() = default;
+  explicit default_formatter(const theme& t) : use_custom_theme_(true), theme_(t) {}
 
   std::string format(const log_entry& entry) const override {
+    const theme active_theme = use_custom_theme_ ? theme_ : detail::config::instance().get_theme();
     std::ostringstream oss;
 
     // source component with fixed width padding
     if (!entry.source.empty()) {
       std::string source_part = "[" + entry.source + "]";
-      oss << detail::colorize(source_part, theme_.source_color, theme_.source_bg_color);
+      oss << detail::colorize(source_part, active_theme.source_color, active_theme.source_bg_color);
 
-      int padding = theme_.source_width - static_cast<int>(source_part.length());
+      int padding = active_theme.source_width - static_cast<int>(source_part.length());
       oss << std::string(std::max(1, padding), ' ');
     }
 
@@ -788,7 +790,7 @@ public:
     std::string level_text = std::string(level_short_name(entry.level_val));
     std::string level_part = "[" + level_text + "]";
 
-    if (theme_.pad_level_text) {
+    if (active_theme.pad_level_text) {
       int target_width = detail::get_max_level_text_width();
       int padding = target_width - static_cast<int>(level_part.length());
       if (padding > 0) {
@@ -796,11 +798,14 @@ public:
       }
     }
 
-    oss << detail::colorize(level_part, level_color(entry.level_val), level_bg_color(entry.level_val)) << " ";
+    oss << detail::colorize(
+               level_part, level_color(entry.level_val, active_theme), level_bg_color(entry.level_val, active_theme)
+           )
+        << " ";
 
     // message component with fixed width (logrus-style)
-    oss << std::left << std::setw(theme_.message_fixed_width)
-        << detail::colorize(entry.message, theme_.message_color, color::none) << std::right;
+    oss << std::left << std::setw(active_theme.message_fixed_width)
+        << detail::colorize(entry.message, active_theme.message_color, color::none) << std::right;
 
     // fields component
     if (!entry.fields.empty()) {
@@ -813,8 +818,8 @@ public:
         }
         first = false;
 
-        oss << detail::colorize(f.key, theme_.field_key_color, color::none) << "="
-            << detail::colorize(f.value, theme_.field_value_color, color::none);
+        oss << detail::colorize(f.key, active_theme.field_key_color, color::none) << "="
+            << detail::colorize(f.value, active_theme.field_value_color, color::none);
       }
     }
 
@@ -872,8 +877,22 @@ public:
   // non-copyable, moveable
   file_sink(const file_sink&) = delete;
   file_sink& operator=(const file_sink&) = delete;
-  file_sink(file_sink&&) = default;
-  file_sink& operator=(file_sink&&) = default;
+  file_sink(file_sink&& other) noexcept : file_(other.file_), should_close_(other.should_close_) {
+    other.file_ = nullptr;
+    other.should_close_ = false;
+  }
+  file_sink& operator=(file_sink&& other) noexcept {
+    if (this != &other) {
+      if (should_close_ && file_) {
+        std::fclose(file_);
+      }
+      file_ = other.file_;
+      should_close_ = other.should_close_;
+      other.file_ = nullptr;
+      other.should_close_ = false;
+    }
+    return *this;
+  }
 
   void write(std::string_view formatted) override {
     if (file_) {
